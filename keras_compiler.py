@@ -1,3 +1,12 @@
+# keras模型做tvm优化
+#
+# 环境：
+# gpu: Nvidia GeForce 3060
+# gpu driver: 470.57.02
+# cuda: cuda_11.2.r11.2/compiler.29373293_0
+# cudnn: v8.1.0
+# tensorflow: tensorflow-gpu==2.4.0
+
 import numpy as np
 import tensorflow as tf
 import tensorflow.keras as keras
@@ -51,7 +60,7 @@ def tvm_compile(keras_model, shape_dict):
     # compile the model
     target = "cuda"
     dev = tvm.cuda(0)
-    tvm.autotvm.measure.measure_methods.set_cuda_target_arch("sm_80")
+    # tvm.autotvm.measure.measure_methods.set_cuda_target_arch("sm_80")
 
     # TODO(mbs): opt_level=3 causes nn.contrib_conv2d_winograd_weight_transform
     # to end up in the module which fails memory validation on cuda most likely
