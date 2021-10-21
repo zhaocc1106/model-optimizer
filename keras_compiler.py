@@ -6,6 +6,7 @@
 # cuda: cuda_11.2.r11.2/compiler.29373293_0
 # cudnn: v8.1.0
 # tensorflow: tensorflow-gpu==2.4.0
+# tvm: 0.8.dev1949+gf4c146ca3
 
 import numpy as np
 import tensorflow as tf
