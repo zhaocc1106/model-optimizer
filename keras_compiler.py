@@ -1,4 +1,6 @@
-# keras模型做tvm优化
+# keras模型做tvm, tf-trt, pure-trt优化并比较对应的性能
+# tf-trt指的是直接使用tensorflow的tensorrt convert接口转换成的模型，使用的推理引擎是tensorflow嵌入tensorrt引擎
+# pure-trt指的是使用pure tensorrt模型，使用的推理引擎是纯tensorrt引擎
 #
 # 环境：
 # gpu: Nvidia GeForce 3060
@@ -8,7 +10,6 @@
 # tensorflow: tensorflow-gpu==2.4.0
 # tensorrt: TensorRT-7.2.1.6
 # tvm: 0.8.dev1949+gf4c146ca3
-
 import os
 import numpy as np
 import tensorflow as tf
@@ -16,8 +17,12 @@ import tensorflow.keras as keras
 import tvm
 import tvm.relay as relay
 import timeit
+import tensorrt as trt
+import pycuda.autoinit
+import pycuda.driver as cuda
 
 from tensorflow.keras.applications.resnet50 import preprocess_input
+from tensorflow.python.compiler.tensorrt import trt_convert
 from tvm.contrib.download import download_testdata
 from PIL import Image
 from matplotlib import pyplot as plt
@@ -28,8 +33,11 @@ gpus = tf.config.experimental.list_physical_devices('GPU')
 for gpu in gpus:
     tf.config.experimental.set_memory_growth(gpu, True)
 
-SAVER_PATH = '/tmp/resnet50/tf_model_saver'
-TRT_PATH = '/tmp/resnet50/trt_model'
+MODEL_PATH = '/tmp/resnet50/'
+SAVER_PATH = MODEL_PATH + 'tf_model_saver'
+TF_TRT_PATH = MODEL_PATH + 'tf_trt_model'
+ONNX_PATH = MODEL_PATH + 'model.onnx'
+TRT_PATH = MODEL_PATH + 'model.trt'
 
 # resnet输出分类映射关系
 SYNSET_URL = "".join(
@@ -103,46 +111,46 @@ def load_data():
     data = np.array(img)[np.newaxis, :].astype("float32")
     print("input_1: ", data.shape)
     data = preprocess_input(data)
+    # print(data)
     return data
 
 
-def confirm_output(keras_model, tvm_model, trt_model, data):
-    """确认两个模型输出是否一致并且正确"""
-    keras_out = keras_model.predict(data)
-    top1_keras = np.argmax(keras_out)
-
-    tvm_out = tvm_model(tvm.nd.array(data.transpose([0, 3, 1, 2]).astype("float32")))
-    top1_tvm = np.argmax(tvm_out.numpy()[0])
-
-    trt_out = trt_model(data)
-    top1_trt = np.argmax(trt_out)
-
+def confirm_output(data, keras_model, tvm_model=None, tf_trt_model=None, trt_engine=None, trt_ctx=None):
+    """确认模型输出是否一致并且正确"""
     synset_path = download_testdata(SYNSET_URL, SYNSET_NAME, module="data")
     with open(synset_path) as f:
         synset = eval(f.read())
-    print("Tvm output top-1 id: {}, class name: {}\nKeras output top-1 id: {}, class name: {}\nTrt output top-1 id: {}"
-          ", class name: {}".format(top1_tvm, synset[top1_tvm], top1_keras, synset[top1_keras], top1_trt,
-                                    synset[top1_trt]))
 
-    assert (top1_keras == top1_tvm)
-    assert (top1_keras == top1_trt)
+    keras_out = keras_model.predict(data)
+    top5_keras = np.argsort(keras_out[0])[-1:-6:-1]
+    print("Keras output top-5 id: {}, predict class name: {}".format(top5_keras, synset[top5_keras[0]]))
+
+    if tvm_model:
+        tvm_out = tvm_model(tvm.nd.array(data.transpose([0, 3, 1, 2]).astype("float32")))
+        top5_tvm = np.argsort(tvm_out.numpy()[0])[-1:-6:-1]
+        print("Tvm output top-5 id: {}, predict class name: {}".format(top5_tvm, synset[top5_tvm[0]]))
+
+    if tf_trt_model:
+        tf_trt_out = tf_trt_model(data)
+        top5_tf_trt = np.argsort(tf_trt_out[0])[-1:-6:-1]
+        print("Tf-trt output top-5 id: {}, predict class name: {}".format(top5_tf_trt, synset[top5_tf_trt[0]]))
+
+    if trt_engine and trt_ctx:
+        input_idx = trt_engine['input_1']
+        output_idx = trt_engine['predictions']
+        # print('input shape: {}, output shape: {}'.format(trt_engine.get_binding_shape(input_idx),
+        #                                                  trt_engine.get_binding_shape(output_idx)))
+        h_input, h_output, d_input, d_output = trt_malloc(data, input_idx, output_idx)
+        stream = cuda.Stream()
+        trt_out = trt_infer(h_input, h_output, d_input, d_output, trt_ctx, stream)
+        top5_trt = np.argsort(trt_out)[-1:-6:-1]
+        print("Pure-trt output top-5 id: {}, predict class name: {}".format(top5_trt, synset[top5_trt[0]]))
 
 
-def compare_infer_speed(keras_model, tvm_model, trt_model, data):
+def compare_infer_speed(data, keras_model, tvm_model=None, tf_trt_model=None, trt_engine=None, trt_ctx=None):
     """比较keras和tvm模型的推理速度"""
     timing_number = 10
     timing_repeat = 10
-    tvm_speed = (
-            np.array(timeit.Timer(lambda: tvm_model(tvm.nd.array(data.transpose([0, 3, 1, 2]).astype("float32"))))
-                     .repeat(repeat=timing_repeat, number=timing_number))
-            * 1000 / timing_number
-    )
-    tvm_speed = {
-        "mean": np.mean(tvm_speed),
-        "median": np.median(tvm_speed),
-        "std": np.std(tvm_speed),
-    }
-
     keras_speed = (
             np.array(timeit.Timer(lambda: keras_model.predict(data))
                      .repeat(repeat=timing_repeat, number=timing_number))
@@ -153,33 +161,65 @@ def compare_infer_speed(keras_model, tvm_model, trt_model, data):
         "median": np.median(keras_speed),
         "std": np.std(keras_speed),
     }
+    print('keras_speed: {}'.format(keras_speed))
 
-    trt_speed = (
-            np.array(timeit.Timer(lambda: trt_model(data))
-                     .repeat(repeat=timing_repeat, number=timing_number))
-            * 1000 / timing_number
-    )
-    trt_speed = {
-        "mean": np.mean(trt_speed),
-        "median": np.median(trt_speed),
-        "std": np.std(trt_speed),
-    }
+    if tvm_model:
+        tvm_speed = (
+                np.array(timeit.Timer(lambda: tvm_model(tvm.nd.array(data.transpose([0, 3, 1, 2]).astype("float32"))))
+                         .repeat(repeat=timing_repeat, number=timing_number))
+                * 1000 / timing_number
+        )
+        tvm_speed = {
+            "mean": np.mean(tvm_speed),
+            "median": np.median(tvm_speed),
+            "std": np.std(tvm_speed),
+        }
+        print('tvm_speed: {}'.format(tvm_speed))
 
-    print('tvm_speed: {}\nkeras_speed: {}\ntrt_speed: {}'.format(tvm_speed, keras_speed, trt_speed))
+    if tf_trt_model:
+        tf_trt_speed = (
+                np.array(timeit.Timer(lambda: tf_trt_model(data))
+                         .repeat(repeat=timing_repeat, number=timing_number))
+                * 1000 / timing_number
+        )
+        tf_trt_speed = {
+            "mean": np.mean(tf_trt_speed),
+            "median": np.median(tf_trt_speed),
+            "std": np.std(tf_trt_speed),
+        }
+        print('tf_trt_speed: {}'.format(tf_trt_speed))
+
+    if trt_engine and trt_ctx:
+        input_idx = trt_engine['input_1']
+        output_idx = trt_engine['predictions']
+        # print('input shape: {}, output shape: {}'.format(trt_engine.get_binding_shape(input_idx),
+        #                                                  trt_engine.get_binding_shape(output_idx)))
+        h_input, h_output, d_input, d_output = trt_malloc(data, input_idx, output_idx)
+        stream = cuda.Stream()
+        trt_speed = (
+                np.array(timeit.Timer(lambda: trt_infer(h_input, h_output, d_input, d_output, trt_ctx, stream))
+                         .repeat(repeat=timing_repeat, number=timing_number))
+                * 1000 / timing_number
+        )
+        trt_speed = {
+            "mean": np.mean(trt_speed),
+            "median": np.median(trt_speed),
+            "std": np.std(trt_speed),
+        }
+        print('trt_speed: {}'.format(trt_speed))
 
 
-def convert_2_trt():
+def convert_2_tf_trt():
     """将模型转换为tf-tensorrt模型"""
-    from tensorflow.python.compiler.tensorrt import trt_convert as trt
-    conversion_params = trt.DEFAULT_TRT_CONVERSION_PARAMS
+    conversion_params = trt_convert.DEFAULT_TRT_CONVERSION_PARAMS
     conversion_params = conversion_params._replace(max_workspace_size_bytes=(1 << 32))
     conversion_params = conversion_params._replace(precision_mode="FP32")
     conversion_params = conversion_params._replace(maximum_cached_engines=100)
     # conversion_params = conversion_params._replace(minimum_segment_size=100)
-    converter = trt.TrtGraphConverterV2(input_saved_model_dir=SAVER_PATH,
-                                        input_saved_model_tags=['serve'],
-                                        input_saved_model_signature_key='serving_default',
-                                        conversion_params=conversion_params)
+    converter = trt_convert.TrtGraphConverterV2(input_saved_model_dir=SAVER_PATH,
+                                                input_saved_model_tags=['serve'],
+                                                input_saved_model_signature_key='serving_default',
+                                                conversion_params=conversion_params)
     converter.convert()
 
     def my_input_fn():
@@ -187,10 +227,54 @@ def convert_2_trt():
         yield [inp]
 
     converter.build(input_fn=my_input_fn)
-    converter.save(TRT_PATH)
-    print('Convert trt completely!')
-    model = tf.saved_model.load(TRT_PATH)
+    converter.save(TF_TRT_PATH)
+    print('Convert tf_trt completely!')
+    model = tf.saved_model.load(TF_TRT_PATH)
     return model
+
+
+def load_trt():
+    """加载pure tensorrt模型引擎"""
+    convert_2_onnx_cmd = 'python -m tf2onnx.convert --saved-model {} --output {} --tag serve' \
+                         ' --signature_def serving_default --target tensorrt --opset 11' \
+        .format(SAVER_PATH, ONNX_PATH)
+    save_trt_engine_cmd = 'trtexec --onnx={} --explicitBatch --shapes=input_1:1x224x224x3 --saveEngine={}' \
+        .format(ONNX_PATH, TRT_PATH)
+    os.system(convert_2_onnx_cmd)  # 将tf模型转换成onnx模型
+    os.system(save_trt_engine_cmd)  # onnx模型转换成pure tensorrt模型
+
+    runtime = trt.Runtime(trt.Logger(trt.Logger.WARNING))
+    with open(TRT_PATH, "rb") as f:
+        serialized_engine = f.read()
+    engine = runtime.deserialize_cuda_engine(serialized_engine)
+    context = engine.create_execution_context()
+    return engine, context
+
+
+def trt_malloc(inp_data, input_idx, output_idx):
+    """malloc tensorrt的input和output的cpu和gpu内存"""
+    # h_input = cuda.pagelocked_empty(trt.volume(trt_engine.get_binding_shape(input_idx)), dtype=np.float32)
+    h_input = np.array(inp_data)
+    h_output = cuda.pagelocked_empty(trt.volume(trt_engine.get_binding_shape(output_idx)), dtype=np.float32)
+    # Allocate device memory for inputs and outputs.
+    d_input = cuda.mem_alloc(h_input.nbytes)
+    d_output = cuda.mem_alloc(h_output.nbytes)
+    return h_input, h_output, d_input, d_output
+
+
+def trt_infer(h_input, h_output, d_input, d_output, trt_ctx, stream):
+    """pure-trt模型推理"""
+    # Create a stream in which to copy inputs/outputs and run inference.
+    # Transfer input data to the GPU.
+    cuda.memcpy_htod_async(d_input, h_input, stream)
+    # Run inference.
+    trt_ctx.execute_async(bindings=[int(d_input), int(d_output)], stream_handle=stream.handle)
+    # Transfer predictions back from the GPU.
+    cuda.memcpy_dtoh_async(h_output, d_output, stream)
+    # Synchronize the stream
+    stream.synchronize()
+    # Return the host output.
+    return h_output
 
 
 if __name__ == '__main__':
@@ -199,14 +283,17 @@ if __name__ == '__main__':
     tvm_model = tvm_compile(keras_model,  # 将keras模型编译转换为tvm模型
                             {"input_1": data.transpose(
                                 [0, 3, 1, 2]).shape})  # tvm input layout是NCHW格式，tensorflow默认为NHWC格式
-    trt_model = convert_2_trt()  # 转换成tf-tensorrt(tensorflow嵌入tensorrt引擎)模型
+    tf_trt_model = convert_2_tf_trt()  # 转换成tf-tensorrt(tensorflow嵌入tensorrt引擎)模型
+    trt_engine, trt_ctx = load_trt()  # 转换成pure-tensorrt(tensorrt引擎推理)模型
 
-    # Tvm output top-1 id: 285, class name: Egyptian cat
-    # Keras output top-1 id: 285, class name: Egyptian cat
-    # Trt output top-1 id: 285, class name: Egyptian cat
-    confirm_output(keras_model, tvm_model, trt_model, data)  # 确认模型的输出是否一致
+    # Keras output top-5 id: [285 282 263 278 281], predict class name: Egyptian cat
+    # Tvm output top-5 id: [285 282 263 278 281], predict class name: Egyptian cat
+    # Tf-trt output top-5 id: [285 282 263 278 281], predict class name: Egyptian cat
+    # Pure-trt output top-5 id: [285 282 263 278 281], predict class name: Egyptian cat
+    confirm_output(data, keras_model, tvm_model, tf_trt_model, trt_engine, trt_ctx)  # 确认模型的输出是否一致
 
-    # tvm_speed: {'mean': 6.871772010017594, 'median': 6.730263200006448, 'std': 0.36091768164278515}
     # keras_speed: {'mean': 38.15342679999958, 'median': 38.13050270000531, 'std': 0.739319260929989}
-    # trt_speed: {'mean': 9.36842440001783, 'median': 9.254672099996242, 'std': 1.0029966871852858}
-    compare_infer_speed(keras_model, tvm_model, trt_model, data)  # 比较模型的推理速度
+    # tvm_speed: {'mean': 6.871772010017594, 'median': 6.730263200006448, 'std': 0.36091768164278515}
+    # tf_trt_speed: {'mean': 9.36842440001783, 'median': 9.254672099996242, 'std': 1.0029966871852858}
+    # trt_speed: {'mean': 2.6983253600064927, 'median': 2.682709500004421, 'std': 0.07963485829412356}
+    compare_infer_speed(data, keras_model, tvm_model, tf_trt_model, trt_engine, trt_ctx)  # 比较模型的推理速度
