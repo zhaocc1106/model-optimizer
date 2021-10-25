@@ -8,7 +8,7 @@
 # cuda: cuda_11.2
 # cudnn: v8.1
 # tensorflow: tensorflow-gpu==2.4.0
-# tensorrt: TensorRT-8.0.0.3
+# tensorrt: TensorRT-8.0.0.3, TensorRT-7.2.1.6(tf-trt需要的版本，tf-trt需要单独跑)
 # tvm: 0.8.dev1949+gf4c146ca3
 import os
 import numpy as np
@@ -97,7 +97,8 @@ def tvm_compile(keras_model, shape_dict, auto_tune=True):
     if auto_tune:
         # 执行auto tvm tuning优化
         tuning_option = {
-            "tuning_records": "resnet-50-v2-autotuning.json",
+            # "tuning_records": "resnet-50-v2-autotuning.json",
+            "tuning_records": "resnet-50.log",
             "tuner": "xgb",
             # "n_trial": 2000,
             "trials": 100,
@@ -109,19 +110,19 @@ def tvm_compile(keras_model, shape_dict, auto_tune=True):
         }
         tasks = autotvm.task.extract_from_program(mod["main"], target=target, params=params)
 
-        # Tune the extracted tasks sequentially.
-        for i, task in enumerate(tasks):
-            prefix = "[Task %2d/%2d] " % (i + 1, len(tasks))
-            tuner_obj = XGBTuner(task, loss_type="rank")
-            tuner_obj.tune(
-                n_trial=min(tuning_option["trials"], len(task.config_space)),
-                early_stopping=tuning_option["early_stopping"],
-                measure_option=tuning_option["measure_option"],
-                callbacks=[
-                    autotvm.callback.progress_bar(tuning_option["trials"], prefix=prefix),
-                    autotvm.callback.log_to_file(tuning_option["tuning_records"]),
-                ],
-            )
+        # # Tune the extracted tasks sequentially.
+        # for i, task in enumerate(tasks):
+        #     prefix = "[Task %2d/%2d] " % (i + 1, len(tasks))
+        #     tuner_obj = XGBTuner(task, loss_type="rank")
+        #     tuner_obj.tune(
+        #         n_trial=min(tuning_option["trials"], len(task.config_space)),
+        #         early_stopping=tuning_option["early_stopping"],
+        #         measure_option=tuning_option["measure_option"],
+        #         callbacks=[
+        #             autotvm.callback.progress_bar(tuning_option["trials"], prefix=prefix),
+        #             autotvm.callback.log_to_file(tuning_option["tuning_records"]),
+        #         ],
+        #     )
 
     # compile the model
     # TODO(mbs): opt_level=3 causes nn.contrib_conv2d_winograd_weight_transform
@@ -321,17 +322,18 @@ if __name__ == '__main__':
         keras_model,  # 将keras模型编译转换为tvm模型
         {"input_1": data.transpose([0, 3, 1, 2]).shape},  # tvm input layout是NCHW格式，tensorflow默认为NHWC格式
         auto_tune=True)  # 执行auto tvm tuning优化
-    tf_trt_model = convert_2_tf_trt()  # 转换成tf-tensorrt(tensorflow嵌入tensorrt引擎)模型
+    # 转换成tf-tensorrt(tensorflow嵌入tensorrt引擎)模型，tf-trt需要单独跑，因为它使用的tensorrt版本是TensorRT-7.2.1.6
+    # tf_trt_model = convert_2_tf_trt()
     trt_engine, trt_ctx = load_trt()  # 转换成pure-tensorrt(tensorrt引擎推理)模型
 
     # Keras output top-5 id: [285 282 263 278 281], predict class name: Egyptian cat
     # Tvm output top-5 id: [285 282 263 278 281], predict class name: Egyptian cat
     # Tf-trt output top-5 id: [285 282 263 278 281], predict class name: Egyptian cat
     # Pure-trt output top-5 id: [285 282 263 278 281], predict class name: Egyptian cat
-    confirm_output(data, keras_model, tvm_model, tf_trt_model, trt_engine, trt_ctx)  # 确认模型的输出是否一致
+    confirm_output(data, keras_model, tvm_model, None, trt_engine, trt_ctx)  # 确认模型的输出是否一致
 
     # keras_speed: {'mean': 38.15342679999958, 'median': 38.13050270000531, 'std': 0.739319260929989}
     # tvm_speed: {'mean': 4.798182540016569, 'median': 4.786621000039304, 'std': 0.3183794419115}
     # tf_trt_speed: {'mean': 9.36842440001783, 'median': 9.254672099996242, 'std': 1.0029966871852858}
     # trt_speed: {'mean': 2.6983253600064927, 'median': 2.682709500004421, 'std': 0.07963485829412356}
-    compare_infer_speed(data, keras_model, tvm_model, tf_trt_model, trt_engine, trt_ctx)  # 比较模型的推理速度
+    compare_infer_speed(data, keras_model, tvm_model, None, trt_engine, trt_ctx)  # 比较模型的推理速度
