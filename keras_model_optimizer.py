@@ -201,8 +201,9 @@ def compare_infer_speed(data, keras_model, tvm_model=None, tf_trt_model=None, tr
     print('keras_speed: {}'.format(keras_speed))
 
     if tvm_model:
+        tvm_data = tvm.nd.array(data.transpose([0, 3, 1, 2]).astype("float32"))
         tvm_speed = (
-                np.array(timeit.Timer(lambda: tvm_model(tvm.nd.array(data.transpose([0, 3, 1, 2]).astype("float32"))))
+                np.array(timeit.Timer(lambda: tvm_model(tvm_data))
                          .repeat(repeat=timing_repeat, number=timing_number))
                 * 1000 / timing_number
         )
@@ -332,7 +333,7 @@ if __name__ == '__main__':
     confirm_output(data, keras_model, tvm_model, None, trt_engine, trt_ctx)  # 确认模型的输出是否一致
 
     # keras_speed: {'mean': 38.15342679999958, 'median': 38.13050270000531, 'std': 0.739319260929989}
-    # tvm_speed: {'mean': 4.798182540016569, 'median': 4.786621000039304, 'std': 0.3183794419115}
+    # tvm_speed: {'mean': 4.332577469986063, 'median': 4.116869249992305, 'std': 0.42891433991018335}
     # tf_trt_speed: {'mean': 9.36842440001783, 'median': 9.254672099996242, 'std': 1.0029966871852858}
     # trt_speed: {'mean': 2.6983253600064927, 'median': 2.682709500004421, 'std': 0.07963485829412356}
     compare_infer_speed(data, keras_model, tvm_model, None, trt_engine, trt_ctx)  # 比较模型的推理速度
