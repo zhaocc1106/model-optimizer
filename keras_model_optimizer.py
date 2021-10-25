@@ -97,8 +97,7 @@ def tvm_compile(keras_model, shape_dict, auto_tune=True):
     if auto_tune:
         # 执行auto tvm tuning优化
         tuning_option = {
-            # "tuning_records": "resnet-50-v2-autotuning.json",
-            "tuning_records": "resnet-50.log",
+            "tuning_records": "resnet-50-v2-autotuning.json",
             "tuner": "xgb",
             # "n_trial": 2000,
             "trials": 100,
@@ -110,19 +109,19 @@ def tvm_compile(keras_model, shape_dict, auto_tune=True):
         }
         tasks = autotvm.task.extract_from_program(mod["main"], target=target, params=params)
 
-        # # Tune the extracted tasks sequentially.
-        # for i, task in enumerate(tasks):
-        #     prefix = "[Task %2d/%2d] " % (i + 1, len(tasks))
-        #     tuner_obj = XGBTuner(task, loss_type="rank")
-        #     tuner_obj.tune(
-        #         n_trial=min(tuning_option["trials"], len(task.config_space)),
-        #         early_stopping=tuning_option["early_stopping"],
-        #         measure_option=tuning_option["measure_option"],
-        #         callbacks=[
-        #             autotvm.callback.progress_bar(tuning_option["trials"], prefix=prefix),
-        #             autotvm.callback.log_to_file(tuning_option["tuning_records"]),
-        #         ],
-        #     )
+        # Tune the extracted tasks sequentially.
+        for i, task in enumerate(tasks):
+            prefix = "[Task %2d/%2d] " % (i + 1, len(tasks))
+            tuner_obj = XGBTuner(task, loss_type="rank")
+            tuner_obj.tune(
+                n_trial=min(tuning_option["trials"], len(task.config_space)),
+                early_stopping=tuning_option["early_stopping"],
+                measure_option=tuning_option["measure_option"],
+                callbacks=[
+                    autotvm.callback.progress_bar(tuning_option["trials"], prefix=prefix),
+                    autotvm.callback.log_to_file(tuning_option["tuning_records"]),
+                ],
+            )
 
     # compile the model
     # TODO(mbs): opt_level=3 causes nn.contrib_conv2d_winograd_weight_transform
