@@ -5,10 +5,10 @@
 # 环境：
 # gpu: Nvidia GeForce 3060
 # gpu driver: 470.57.02
-# cuda: cuda_11.0
-# cudnn: v8.0
+# cuda: cuda_11.2
+# cudnn: v8.1
 # tensorflow: tensorflow-gpu==2.4.0
-# tensorrt: TensorRT-7.2.1.6
+# tensorrt: TensorRT-8.0.0.3
 # tvm: 0.8.dev1949+gf4c146ca3
 import os
 import numpy as np
