@@ -24,6 +24,9 @@ import pycuda.driver as cuda
 from tensorflow.keras.applications.resnet50 import preprocess_input
 from tensorflow.python.compiler.tensorrt import trt_convert
 from tvm.contrib.download import download_testdata
+import tvm.auto_scheduler as auto_scheduler
+from tvm.autotvm.tuner import XGBTuner
+from tvm import autotvm
 from PIL import Image
 from matplotlib import pyplot as plt
 
@@ -84,20 +87,54 @@ def load_keras_model():
     return keras_resnet50
 
 
-def tvm_compile(keras_model, shape_dict):
+def tvm_compile(keras_model, shape_dict, auto_tune=True):
     """将keras模型编译为tvm模型"""
     mod, params = relay.frontend.from_keras(keras_model, shape_dict)
-    # compile the model
     target = "cuda"
     dev = tvm.cuda(0)
-    tvm.autotvm.measure.measure_methods.set_cuda_target_arch("sm_80")
+    # tvm.autotvm.measure.measure_methods.set_cuda_target_arch("sm_80")
 
+    if auto_tune:
+        # 执行auto tvm tuning优化
+        tuning_option = {
+            "tuning_records": "resnet-50-v2-autotuning.json",
+            "tuner": "xgb",
+            # "n_trial": 2000,
+            "trials": 100,
+            "early_stopping": 600,
+            "measure_option": autotvm.measure_option(
+                builder=autotvm.LocalBuilder(timeout=10),
+                runner=autotvm.LocalRunner(number=20, repeat=3, timeout=4, min_repeat_ms=150),
+            ),
+        }
+        tasks = autotvm.task.extract_from_program(mod["main"], target=target, params=params)
+
+        # Tune the extracted tasks sequentially.
+        for i, task in enumerate(tasks):
+            prefix = "[Task %2d/%2d] " % (i + 1, len(tasks))
+            tuner_obj = XGBTuner(task, loss_type="rank")
+            tuner_obj.tune(
+                n_trial=min(tuning_option["trials"], len(task.config_space)),
+                early_stopping=tuning_option["early_stopping"],
+                measure_option=tuning_option["measure_option"],
+                callbacks=[
+                    autotvm.callback.progress_bar(tuning_option["trials"], prefix=prefix),
+                    autotvm.callback.log_to_file(tuning_option["tuning_records"]),
+                ],
+            )
+
+    # compile the model
     # TODO(mbs): opt_level=3 causes nn.contrib_conv2d_winograd_weight_transform
     # to end up in the module which fails memory validation on cuda most likely
     # due to a latent bug. Note that the pass context only has an effect within
     # evaluate() and is not captured by create_executor().
-    with tvm.transform.PassContext(opt_level=0):
-        model = relay.build_module.create_executor("graph", mod, dev, target, params).evaluate()
+    if auto_tune:
+        with autotvm.apply_history_best(tuning_option["tuning_records"]):
+            with tvm.transform.PassContext(opt_level=3):
+                model = relay.build_module.create_executor("graph", mod, dev, target, params).evaluate()
+    else:
+        with tvm.transform.PassContext(opt_level=3):
+            model = relay.build_module.create_executor("graph", mod, dev, target, params).evaluate()
     return model
 
 
@@ -280,9 +317,10 @@ def trt_infer(h_input, h_output, d_input, d_output, trt_ctx, stream):
 if __name__ == '__main__':
     data = load_data()  # 加载测试数据
     keras_model = load_keras_model()  # 加载一个keras模型
-    tvm_model = tvm_compile(keras_model,  # 将keras模型编译转换为tvm模型
-                            {"input_1": data.transpose(
-                                [0, 3, 1, 2]).shape})  # tvm input layout是NCHW格式，tensorflow默认为NHWC格式
+    tvm_model = tvm_compile(
+        keras_model,  # 将keras模型编译转换为tvm模型
+        {"input_1": data.transpose([0, 3, 1, 2]).shape},  # tvm input layout是NCHW格式，tensorflow默认为NHWC格式
+        auto_tune=True)  # 执行auto tvm tuning优化
     tf_trt_model = convert_2_tf_trt()  # 转换成tf-tensorrt(tensorflow嵌入tensorrt引擎)模型
     trt_engine, trt_ctx = load_trt()  # 转换成pure-tensorrt(tensorrt引擎推理)模型
 
@@ -293,7 +331,7 @@ if __name__ == '__main__':
     confirm_output(data, keras_model, tvm_model, tf_trt_model, trt_engine, trt_ctx)  # 确认模型的输出是否一致
 
     # keras_speed: {'mean': 38.15342679999958, 'median': 38.13050270000531, 'std': 0.739319260929989}
-    # tvm_speed: {'mean': 6.871772010017594, 'median': 6.730263200006448, 'std': 0.36091768164278515}
+    # tvm_speed: {'mean': 4.798182540016569, 'median': 4.786621000039304, 'std': 0.3183794419115}
     # tf_trt_speed: {'mean': 9.36842440001783, 'median': 9.254672099996242, 'std': 1.0029966871852858}
     # trt_speed: {'mean': 2.6983253600064927, 'median': 2.682709500004421, 'std': 0.07963485829412356}
     compare_infer_speed(data, keras_model, tvm_model, tf_trt_model, trt_engine, trt_ctx)  # 比较模型的推理速度
