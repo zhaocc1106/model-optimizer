@@ -20,6 +20,7 @@ import tensorrt as trt
 import torch
 import torchvision
 from PIL import Image
+from matplotlib import pyplot as plt
 
 MODEL_PATH = '/tmp/resnet-50/'
 ONNX_MODEL_PATH = MODEL_PATH + 'model.onnx'
