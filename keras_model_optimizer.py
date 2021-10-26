@@ -152,6 +152,72 @@ def load_data():
     return data
 
 
+def convert_2_tf_trt():
+    """将模型转换为tf-tensorrt模型"""
+    conversion_params = trt_convert.DEFAULT_TRT_CONVERSION_PARAMS
+    conversion_params = conversion_params._replace(max_workspace_size_bytes=(1 << 32))
+    conversion_params = conversion_params._replace(precision_mode="FP32")
+    conversion_params = conversion_params._replace(maximum_cached_engines=100)
+    # conversion_params = conversion_params._replace(minimum_segment_size=100)
+    converter = trt_convert.TrtGraphConverterV2(input_saved_model_dir=SAVER_PATH,
+                                                input_saved_model_tags=['serve'],
+                                                input_saved_model_signature_key='serving_default',
+                                                conversion_params=conversion_params)
+    converter.convert()
+
+    def my_input_fn():
+        inp = np.zeros(shape=(1, 244, 244, 3)).astype(np.float32)  # 这里的batch要比预估时的batch要大，否则在预估时会重新构建engine，很耗时
+        yield [inp]
+
+    converter.build(input_fn=my_input_fn)
+    converter.save(TF_TRT_PATH)
+    print('Convert tf_trt completely!')
+    model = tf.saved_model.load(TF_TRT_PATH)
+    return model
+
+
+def load_trt():
+    """加载pure tensorrt模型引擎"""
+    convert_2_onnx_cmd = 'python -m tf2onnx.convert --saved-model {} --output {} --tag serve' \
+                         ' --signature_def serving_default --target tensorrt --opset 11' \
+        .format(SAVER_PATH, ONNX_PATH)
+    save_trt_engine_cmd = 'trtexec --onnx={} --explicitBatch --shapes=input_1:1x224x224x3 --saveEngine={}' \
+        .format(ONNX_PATH, TRT_PATH)
+    os.system(convert_2_onnx_cmd)  # 将tf模型转换成onnx模型
+    os.system(save_trt_engine_cmd)  # onnx模型转换成pure tensorrt模型
+
+    runtime = trt.Runtime(trt.Logger(trt.Logger.WARNING))
+    with open(TRT_PATH, "rb") as f:
+        serialized_engine = f.read()
+    engine = runtime.deserialize_cuda_engine(serialized_engine)
+    context = engine.create_execution_context()
+    return engine, context
+
+
+def trt_malloc(trt_engine, inp_data, input_idx, output_idx):
+    """malloc tensorrt的input和output的cpu和gpu内存"""
+    # h_input = cuda.pagelocked_empty(trt.volume(trt_engine.get_binding_shape(input_idx)), dtype=np.float32)
+    h_input = np.array(inp_data)
+    h_output = cuda.pagelocked_empty(trt.volume(trt_engine.get_binding_shape(output_idx)), dtype=np.float32)
+    # Allocate device memory for inputs and outputs.
+    d_input = cuda.mem_alloc(h_input.nbytes)
+    d_output = cuda.mem_alloc(h_output.nbytes)
+    return h_input, h_output, d_input, d_output
+
+
+def trt_infer(h_input, h_output, d_input, d_output, trt_ctx, stream):
+    """pure-trt模型推理"""
+    # 拷贝输入数据从cpu到gpu
+    cuda.memcpy_htod_async(d_input, h_input, stream)
+    # 执行推理
+    trt_ctx.execute_async(bindings=[int(d_input), int(d_output)], stream_handle=stream.handle)
+    # 拷贝输出数据从gpu到cpu
+    cuda.memcpy_dtoh_async(h_output, d_output, stream)
+    # 同步等待cuda stream执行完毕
+    stream.synchronize()
+    return h_output
+
+
 def confirm_output(data, keras_model, tvm_model=None, tf_trt_model=None, trt_engine=None, trt_ctx=None):
     """确认模型输出是否一致并且正确"""
     synset_path = download_testdata(SYNSET_URL, SYNSET_NAME, module="data")
@@ -177,15 +243,15 @@ def confirm_output(data, keras_model, tvm_model=None, tf_trt_model=None, trt_eng
         output_idx = trt_engine['predictions']
         # print('input shape: {}, output shape: {}'.format(trt_engine.get_binding_shape(input_idx),
         #                                                  trt_engine.get_binding_shape(output_idx)))
-        h_input, h_output, d_input, d_output = trt_malloc(data, input_idx, output_idx)
-        stream = cuda.Stream()
+        h_input, h_output, d_input, d_output = trt_malloc(trt_engine, data, input_idx, output_idx)
+        stream = cuda.Stream()  # 创建cuda stream，一个stream对应一系列cuda操作，譬如拷贝内存与执行cuda核函数
         trt_out = trt_infer(h_input, h_output, d_input, d_output, trt_ctx, stream)
         top5_trt = np.argsort(trt_out)[-1:-6:-1]
         print("Pure-trt output top-5 id: {}, predict class name: {}".format(top5_trt, synset[top5_trt[0]]))
 
 
 def compare_infer_speed(data, keras_model, tvm_model=None, tf_trt_model=None, trt_engine=None, trt_ctx=None):
-    """比较keras和tvm模型的推理速度"""
+    """比较不同模型的推理速度"""
     timing_number = 10
     timing_repeat = 10
     keras_speed = (
@@ -232,8 +298,8 @@ def compare_infer_speed(data, keras_model, tvm_model=None, tf_trt_model=None, tr
         output_idx = trt_engine['predictions']
         # print('input shape: {}, output shape: {}'.format(trt_engine.get_binding_shape(input_idx),
         #                                                  trt_engine.get_binding_shape(output_idx)))
-        h_input, h_output, d_input, d_output = trt_malloc(data, input_idx, output_idx)
-        stream = cuda.Stream()
+        h_input, h_output, d_input, d_output = trt_malloc(trt_engine, data, input_idx, output_idx)
+        stream = cuda.Stream()  # 创建cuda stream，一个stream对应一系列cuda操作，譬如拷贝内存与执行cuda核函数
         trt_speed = (
                 np.array(timeit.Timer(lambda: trt_infer(h_input, h_output, d_input, d_output, trt_ctx, stream))
                          .repeat(repeat=timing_repeat, number=timing_number))
@@ -245,74 +311,6 @@ def compare_infer_speed(data, keras_model, tvm_model=None, tf_trt_model=None, tr
             "std": np.std(trt_speed),
         }
         print('trt_speed: {}'.format(trt_speed))
-
-
-def convert_2_tf_trt():
-    """将模型转换为tf-tensorrt模型"""
-    conversion_params = trt_convert.DEFAULT_TRT_CONVERSION_PARAMS
-    conversion_params = conversion_params._replace(max_workspace_size_bytes=(1 << 32))
-    conversion_params = conversion_params._replace(precision_mode="FP32")
-    conversion_params = conversion_params._replace(maximum_cached_engines=100)
-    # conversion_params = conversion_params._replace(minimum_segment_size=100)
-    converter = trt_convert.TrtGraphConverterV2(input_saved_model_dir=SAVER_PATH,
-                                                input_saved_model_tags=['serve'],
-                                                input_saved_model_signature_key='serving_default',
-                                                conversion_params=conversion_params)
-    converter.convert()
-
-    def my_input_fn():
-        inp = np.zeros(shape=(1, 244, 244, 3)).astype(np.float32)  # 这里的batch要比预估时的batch要大，否则在预估时会重新构建engine，很耗时
-        yield [inp]
-
-    converter.build(input_fn=my_input_fn)
-    converter.save(TF_TRT_PATH)
-    print('Convert tf_trt completely!')
-    model = tf.saved_model.load(TF_TRT_PATH)
-    return model
-
-
-def load_trt():
-    """加载pure tensorrt模型引擎"""
-    convert_2_onnx_cmd = 'python -m tf2onnx.convert --saved-model {} --output {} --tag serve' \
-                         ' --signature_def serving_default --target tensorrt --opset 11' \
-        .format(SAVER_PATH, ONNX_PATH)
-    save_trt_engine_cmd = 'trtexec --onnx={} --explicitBatch --shapes=input_1:1x224x224x3 --saveEngine={}' \
-        .format(ONNX_PATH, TRT_PATH)
-    os.system(convert_2_onnx_cmd)  # 将tf模型转换成onnx模型
-    os.system(save_trt_engine_cmd)  # onnx模型转换成pure tensorrt模型
-
-    runtime = trt.Runtime(trt.Logger(trt.Logger.WARNING))
-    with open(TRT_PATH, "rb") as f:
-        serialized_engine = f.read()
-    engine = runtime.deserialize_cuda_engine(serialized_engine)
-    context = engine.create_execution_context()
-    return engine, context
-
-
-def trt_malloc(inp_data, input_idx, output_idx):
-    """malloc tensorrt的input和output的cpu和gpu内存"""
-    # h_input = cuda.pagelocked_empty(trt.volume(trt_engine.get_binding_shape(input_idx)), dtype=np.float32)
-    h_input = np.array(inp_data)
-    h_output = cuda.pagelocked_empty(trt.volume(trt_engine.get_binding_shape(output_idx)), dtype=np.float32)
-    # Allocate device memory for inputs and outputs.
-    d_input = cuda.mem_alloc(h_input.nbytes)
-    d_output = cuda.mem_alloc(h_output.nbytes)
-    return h_input, h_output, d_input, d_output
-
-
-def trt_infer(h_input, h_output, d_input, d_output, trt_ctx, stream):
-    """pure-trt模型推理"""
-    # Create a stream in which to copy inputs/outputs and run inference.
-    # Transfer input data to the GPU.
-    cuda.memcpy_htod_async(d_input, h_input, stream)
-    # Run inference.
-    trt_ctx.execute_async(bindings=[int(d_input), int(d_output)], stream_handle=stream.handle)
-    # Transfer predictions back from the GPU.
-    cuda.memcpy_dtoh_async(h_output, d_output, stream)
-    # Synchronize the stream
-    stream.synchronize()
-    # Return the host output.
-    return h_output
 
 
 if __name__ == '__main__':
