@@ -50,6 +50,7 @@ def preprocess_input(img):
 
 def load_data():
     """加载测试数据"""
+    print('Loading image data...')
     img_url = "https://github.com/dmlc/mxnet.js/blob/main/data/cat.png?raw=true"
     urllib.request.urlretrieve(img_url, './cat.png')
     img = Image.open('./cat.png').resize((224, 224))
@@ -62,6 +63,7 @@ def load_data():
 
 def load_torch_model():
     """加载pytorch resnet-50模型"""
+    print('Loading pytorch model...')
     model = torchvision.models.resnet50(pretrained=True).eval().cuda()
     print('Loaded pytorch resnet-50 model.')
     return model
@@ -86,6 +88,7 @@ def load_trt_model(torch_model):
     os.system(save_trt_engine_cmd)
 
     # 加载tensorrt引擎文件
+    print('Creating tensorrt engine...')
     runtime = trt.Runtime(trt.Logger(trt.Logger.WARNING))
     with open(TRT_MODEL_PATH, "rb") as f:
         serialized_engine = f.read()
@@ -118,7 +121,7 @@ def trt_infer(h_input, h_output, d_input, d_output, trt_ctx, stream):
     return h_output
 
 
-def confirm_output(data, torch_model, trt_engine=None, trt_ctx=None):
+def confirm_output(data, torch_model, trt_engine, trt_ctx):
     """确认不同模型输出是否一致"""
     urllib.request.urlretrieve(SYNSET_URL, SYNSET_NAME)
     with open(SYNSET_NAME) as f:
@@ -129,22 +132,21 @@ def confirm_output(data, torch_model, trt_engine=None, trt_ctx=None):
     torch_top5 = torch.argsort(torch_output, 1).cpu().detach().numpy()[0][-1:-6:-1]
     print("Torch output top-5 id: {}, predict class name: {}".format(torch_top5, synset[torch_top5[0]]))
 
-    if trt_engine and trt_ctx:
-        input_idx = trt_engine['input']
-        output_idx = trt_engine['output']
-        # print('input shape: {}, output shape: {}'.format(trt_engine.get_binding_shape(input_idx),
-        #                                                  trt_engine.get_binding_shape(output_idx)))
-        h_input, h_output, d_input, d_output = trt_malloc(trt_engine,
-                                                          np.ascontiguousarray(data),
-                                                          input_idx,
-                                                          output_idx)
-        stream = cuda.Stream()  # 创建cuda stream，一个stream对应一系列cuda操作，譬如拷贝内存与执行cuda核函数
-        trt_out = trt_infer(h_input, h_output, d_input, d_output, trt_ctx, stream)
-        top5_trt = np.argsort(trt_out)[-1:-6:-1]
-        print("Pure-trt output top-5 id: {}, predict class name: {}".format(top5_trt, synset[top5_trt[0]]))
+    input_idx = trt_engine['input']
+    output_idx = trt_engine['output']
+    # print('input shape: {}, output shape: {}'.format(trt_engine.get_binding_shape(input_idx),
+    #                                                  trt_engine.get_binding_shape(output_idx)))
+    h_input, h_output, d_input, d_output = trt_malloc(trt_engine,
+                                                      np.ascontiguousarray(data),
+                                                      input_idx,
+                                                      output_idx)
+    stream = cuda.Stream()  # 创建cuda stream，一个stream对应一系列cuda操作，譬如拷贝内存与执行cuda核函数
+    trt_out = trt_infer(h_input, h_output, d_input, d_output, trt_ctx, stream)
+    top5_trt = np.argsort(trt_out)[-1:-6:-1]
+    print("Pure-trt output top-5 id: {}, predict class name: {}".format(top5_trt, synset[top5_trt[0]]))
 
 
-def compare_infer_speed(data, torch_model, trt_engine=None, trt_ctx=None):
+def compare_infer_speed(data, torch_model, trt_engine, trt_ctx):
     """比较不同模型的推理速度"""
     timing_number = 10
     timing_repeat = 10
@@ -159,29 +161,28 @@ def compare_infer_speed(data, torch_model, trt_engine=None, trt_ctx=None):
         "median": np.median(torch_speed),
         "std": np.std(torch_speed),
     }
-    print('torch_speed: {}'.format(torch_speed))
 
-    if trt_engine and trt_ctx:
-        input_idx = trt_engine['input']
-        output_idx = trt_engine['output']
-        # print('input shape: {}, output shape: {}'.format(trt_engine.get_binding_shape(input_idx),
-        #                                                  trt_engine.get_binding_shape(output_idx)))
-        h_input, h_output, d_input, d_output = trt_malloc(trt_engine,
-                                                          np.ascontiguousarray(data),
-                                                          input_idx,
-                                                          output_idx)
-        stream = cuda.Stream()  # 创建cuda stream，一个stream对应一系列cuda操作，譬如拷贝内存与执行cuda核函数
-        trt_speed = (
-                np.array(timeit.Timer(lambda: trt_infer(h_input, h_output, d_input, d_output, trt_ctx, stream))
-                         .repeat(repeat=timing_repeat, number=timing_number))
-                * 1000 / timing_number
-        )
-        trt_speed = {
-            "mean": np.mean(trt_speed),
-            "median": np.median(trt_speed),
-            "std": np.std(trt_speed),
-        }
-        print('trt_speed: {}'.format(trt_speed))
+    input_idx = trt_engine['input']
+    output_idx = trt_engine['output']
+    # print('input shape: {}, output shape: {}'.format(trt_engine.get_binding_shape(input_idx),
+    #                                                  trt_engine.get_binding_shape(output_idx)))
+    h_input, h_output, d_input, d_output = trt_malloc(trt_engine,
+                                                      np.ascontiguousarray(data),
+                                                      input_idx,
+                                                      output_idx)
+    stream = cuda.Stream()  # 创建cuda stream，一个stream对应一系列cuda操作，譬如拷贝内存与执行cuda核函数
+    trt_speed = (
+            np.array(timeit.Timer(lambda: trt_infer(h_input, h_output, d_input, d_output, trt_ctx, stream))
+                     .repeat(repeat=timing_repeat, number=timing_number))
+            * 1000 / timing_number
+    )
+    trt_speed = {
+        "mean": np.mean(trt_speed),
+        "median": np.median(trt_speed),
+        "std": np.std(trt_speed),
+    }
+
+    print('torch_speed: {}\ntrt_speed:{}'.format(torch_speed, trt_speed))
 
 
 if __name__ == '__main__':
