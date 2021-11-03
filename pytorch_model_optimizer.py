@@ -7,7 +7,7 @@
 # cuda: cuda_11.3
 # cudnn: v8.1
 # pytorch: torch-1.10.0+cu113 torchvision-0.11.1+cu113
-# tensorrt: TensorRT-8.0.0.3
+# tensorrt: TensorRT-8.2.0.0
 
 import os
 import timeit
@@ -19,12 +19,14 @@ import pycuda.driver as cuda
 import tensorrt as trt
 import torch
 import torchvision
+import onnxruntime as onnx_rt
 from PIL import Image
 from matplotlib import pyplot as plt
 
 MODEL_PATH = '/tmp/resnet-50/'
 ONNX_MODEL_PATH = MODEL_PATH + 'model.onnx'
 TRT_MODEL_PATH = MODEL_PATH + 'model.trt'
+MAX_BATCH_SIZE = 128
 
 # resnet输出分类映射关系
 SYNSET_URL = "".join(
@@ -69,56 +71,154 @@ def load_torch_model():
     return model
 
 
-def load_trt_model(torch_model):
-    """转换并加载pure-tensorrt模型"""
-    # 先把torch模型转换成onnx
+def load_onnx_model(torch_model):
+    """加载onnx模型"""
+    # torch模型转换成onnx
     print('Transfer torch model to onnx model...')
     dummy_input = torch.randn(1, 3, 224, 224, device="cuda")
     input_names = ["input"]
     output_names = ["output"]
     if not os.path.exists(MODEL_PATH):
         os.makedirs(MODEL_PATH)
-    torch.onnx.export(torch_model, dummy_input, ONNX_MODEL_PATH, verbose=True, input_names=input_names,
-                      output_names=output_names)
+    torch.onnx.export(torch_model, dummy_input, ONNX_MODEL_PATH, verbose=True,
+                      input_names=input_names,
+                      output_names=output_names,
+                      dynamic_axes={'input': [0], 'output': [0]})
 
+    onnx_sess = onnx_rt.InferenceSession(ONNX_MODEL_PATH)
+    return onnx_sess
+
+
+def onnx_2_trt_engine_by_trtexec():
+    """通过trtexec命令转换onnx模型到pure-tensorrt engine文件并保存"""
     # onnx执行tensorrt优化并保存引擎文件
     print('Apply tensorrt optimizing...')
-    save_trt_engine_cmd = 'trtexec --onnx={} --explicitBatch --saveEngine={}' \
-        .format(ONNX_MODEL_PATH, TRT_MODEL_PATH)
+    save_trt_engine_cmd = 'trtexec --onnx={} --saveEngine={} --minShapes=input:1x3x224x224' \
+                          ' --maxShapes=input:{}x3x224x224 --optShapes=input:64x3x224x224 --best' \
+                          ' --exportLayerInfo={}' \
+        .format(ONNX_MODEL_PATH, TRT_MODEL_PATH, MAX_BATCH_SIZE, MODEL_PATH + 'layer_info.json')
     os.system(save_trt_engine_cmd)
+    return True
 
-    # 加载tensorrt引擎文件
-    print('Creating tensorrt engine...')
-    runtime = trt.Runtime(trt.Logger(trt.Logger.WARNING))
+
+class MyCalibrator(trt.IInt8EntropyCalibrator2):
+    def __init__(self):
+        trt.IInt8EntropyCalibrator2.__init__(self)
+        self.device_input = cuda.mem_alloc(1 * 3 * 224 * 224 * 4)
+        self.batches = iter([np.ascontiguousarray(load_data())])  # 这里应该是一批典型输入的迭代器
+        self.cache_file = MODEL_PATH + '/calibrator_cache'
+
+    def get_algorithm(self):
+        return trt.CalibrationAlgoType.ENTROPY_CALIBRATION_2
+
+    def get_batch(self, names):
+        try:
+            # Assume self.batches is a generator that provides batch data.
+            data = next(self.batches)
+            # Assume that self.device_input is a device buffer allocated by the constructor.
+            cuda.memcpy_htod(self.device_input, data)
+            return [int(self.device_input)]
+        except StopIteration:
+            # When we're out of batches, we return either [] or None.
+            # This signals to TensorRT that there is no calibration data remaining.
+            return None
+
+    def get_batch_size(self):
+        return 1
+
+    def read_calibration_cache(self):
+        # If there is a cache, use it instead of calibrating again. Otherwise, implicitly return None.
+        if os.path.exists(self.cache_file):
+            with open(self.cache_file, "rb") as f:
+                return f.read()
+
+    def write_calibration_cache(self, cache):
+        with open(self.cache_file, "wb") as f:
+            f.write(cache)
+
+
+def onnx_2_trt_engine_by_api():
+    """通过trt api转换onnx模型到pure-tensorrt engine并保存"""
+    logger = trt.Logger(trt.Logger.INFO)
+
+    # trt解析onnx模型
+    builder = trt.Builder(logger)
+    print('platform_has_tf32: {}, platform_has_fast_fp16: {}, platform_has_fast_int8: {}'
+          .format(builder.platform_has_tf32, builder.platform_has_fast_fp16, builder.platform_has_fast_int8))
+    network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+    parser = trt.OnnxParser(network, logger)
+    success = parser.parse_from_file(ONNX_MODEL_PATH)
+    for idx in range(parser.num_errors):
+        print(parser.get_error(idx))
+    if not success:
+        print('parse onnx model failed.')
+        return False
+    print('parse onnx model successfully.')
+
+    print('Creating trt serialized engining...')
+    # build trt config
+    config = builder.create_builder_config()
+    config.max_workspace_size = 1 << 30  # 1GB
+    # 混合精度
+    config.set_flag(trt.BuilderFlag.TF32)
+    config.set_flag(trt.BuilderFlag.FP16)
+    config.set_flag(trt.BuilderFlag.INT8)  # int8量化
+    config.set_quantization_flag(trt.QuantizationFlag.CALIBRATE_BEFORE_FUSION)
+    config.int8_calibrator = MyCalibrator()  # int8量化的校准器，提供一些代表性输入，方便trt量化时计算激活函数范围用于量化
+    # 动态输入shape
+    op_profile = builder.create_optimization_profile()
+    op_profile.set_shape(network.get_input(0).name, min=trt.Dims([1, 3, 224, 224]), opt=trt.Dims([64, 3, 224, 224]),
+                         max=trt.Dims([MAX_BATCH_SIZE, 3, 224, 224]))
+    config.add_optimization_profile(op_profile)
+
+    # 保存serialized engine到文件
+    serialized_engine = builder.build_serialized_network(network, config)
+    with open(TRT_MODEL_PATH, 'wb') as f:
+        f.write(serialized_engine)
+
+    return True
+
+
+def load_trt_engine():
+    """从trt serialized engine文件加载trt engine"""
+    print('Loading tensorrt engine...')
+    runtime = trt.Runtime(trt.Logger(trt.Logger.ERROR))
     with open(TRT_MODEL_PATH, "rb") as f:
         serialized_engine = f.read()
     engine = runtime.deserialize_cuda_engine(serialized_engine)  # 创建trt engine
+    inspector = engine.create_engine_inspector()
+    print('engine layer_info:\n{}'.format(
+        inspector.get_engine_information(trt.LayerInformationFormat(1))))  # 打印engine layer描述
     context = engine.create_execution_context()  # 创建trt执行上下文
     return engine, context
 
 
-def trt_malloc(trt_engine, inp_data, input_idx, output_idx):
+def trt_malloc(inp_data):
     """malloc tensorrt的input和output的cpu和gpu内存"""
-    # h_input = cuda.pagelocked_empty(trt.volume(trt_engine.get_binding_shape(input_idx)), dtype=np.float32)
+    # h_input = cuda.pagelocked_empty(trt.volume(input_shape), dtype=np.float32)
     h_input = np.array(inp_data)
-    h_output = cuda.pagelocked_empty(trt.volume(trt_engine.get_binding_shape(output_idx)), dtype=np.float32)
+    h_output = cuda.pagelocked_empty(MAX_BATCH_SIZE * 1000 * 4, dtype=np.float32)  # 可以申请比较大的batch size方便不同输入重复利用
     # Allocate device memory for inputs and outputs.
-    d_input = cuda.mem_alloc(h_input.nbytes)
-    d_output = cuda.mem_alloc(h_output.nbytes)
+    # print('h_input.nbytes: {}, h_output.nbytes: {}'.format(h_input.nbytes, h_output.nbytes))
+    d_input = cuda.mem_alloc(MAX_BATCH_SIZE * 3 * 224 * 224 * 4)  # 可以申请比较大的batch size方便不同输入重复利用这块显存
+    d_output = cuda.mem_alloc(MAX_BATCH_SIZE * 1000 * 4)  # 可以申请比较大的batch size方便不同输入重复利用这块显存
     return h_input, h_output, d_input, d_output
 
 
-def trt_infer(h_input, h_output, d_input, d_output, trt_ctx, stream):
+def trt_infer(input_idx, h_input, h_output, d_input, d_output, trt_ctx, stream):
     """pure-trt模型推理"""
+    output_volume = trt.volume((h_input.shape[0], 1000))
+    # 设置真实的input shape
+    trt_ctx.set_binding_shape(input_idx, h_input.shape)
     # 拷贝输入数据从cpu到gpu
     cuda.memcpy_htod_async(d_input, h_input, stream)
     # 执行推理
-    trt_ctx.execute_async(bindings=[int(d_input), int(d_output)], stream_handle=stream.handle)
+    trt_ctx.execute_async_v2(bindings=[int(d_input), int(d_output)], stream_handle=stream.handle)
     # 拷贝输出数据从gpu到cpu
-    cuda.memcpy_dtoh_async(h_output, d_output, stream)
+    cuda.memcpy_dtoh_async(h_output[:output_volume], d_output, stream)
     # 同步等待cuda stream执行完毕
     stream.synchronize()
-    return h_output
+    return h_output[:output_volume].reshape((h_input.shape[0], 1000))
 
 
 def confirm_output(data, torch_model, trt_engine, trt_ctx):
@@ -134,15 +234,12 @@ def confirm_output(data, torch_model, trt_engine, trt_ctx):
 
     input_idx = trt_engine['input']
     output_idx = trt_engine['output']
-    # print('input shape: {}, output shape: {}'.format(trt_engine.get_binding_shape(input_idx),
-    #                                                  trt_engine.get_binding_shape(output_idx)))
-    h_input, h_output, d_input, d_output = trt_malloc(trt_engine,
-                                                      np.ascontiguousarray(data),
-                                                      input_idx,
-                                                      output_idx)
+    # print('input shape: {}, output shape: {}'.format(trt_ctx.get_binding_shape(input_idx),
+    #                                                  trt_ctx.get_binding_shape(output_idx)))
+    h_input, h_output, d_input, d_output = trt_malloc(np.ascontiguousarray(data))
     stream = cuda.Stream()  # 创建cuda stream，一个stream对应一系列cuda操作，譬如拷贝内存与执行cuda核函数
-    trt_out = trt_infer(h_input, h_output, d_input, d_output, trt_ctx, stream)
-    top5_trt = np.argsort(trt_out)[-1:-6:-1]
+    trt_out = trt_infer(input_idx, h_input, h_output, d_input, d_output, trt_ctx, stream)
+    top5_trt = np.argsort(trt_out[0])[-1:-6:-1]
     print("Pure-trt output top-5 id: {}, predict class name: {}".format(top5_trt, synset[top5_trt[0]]))
 
 
@@ -164,15 +261,12 @@ def compare_infer_speed(data, torch_model, trt_engine, trt_ctx):
 
     input_idx = trt_engine['input']
     output_idx = trt_engine['output']
-    # print('input shape: {}, output shape: {}'.format(trt_engine.get_binding_shape(input_idx),
-    #                                                  trt_engine.get_binding_shape(output_idx)))
-    h_input, h_output, d_input, d_output = trt_malloc(trt_engine,
-                                                      np.ascontiguousarray(data),
-                                                      input_idx,
-                                                      output_idx)
+    # print('input shape: {}, output shape: {}'.format(trt_ctx.get_binding_shape(input_idx),
+    #                                                  trt_ctx.get_binding_shape(output_idx)))
+    h_input, h_output, d_input, d_output = trt_malloc(np.ascontiguousarray(data))
     stream = cuda.Stream()  # 创建cuda stream，一个stream对应一系列cuda操作，譬如拷贝内存与执行cuda核函数
     trt_speed = (
-            np.array(timeit.Timer(lambda: trt_infer(h_input, h_output, d_input, d_output, trt_ctx, stream))
+            np.array(timeit.Timer(lambda: trt_infer(input_idx, h_input, h_output, d_input, d_output, trt_ctx, stream))
                      .repeat(repeat=timing_repeat, number=timing_number))
             * 1000 / timing_number
     )
@@ -189,12 +283,15 @@ if __name__ == '__main__':
     data = load_data()  # 加载测试数据
 
     torch_model = load_torch_model()  # 加载torch resnet-50模型
-    trt_engine, trt_ctx = load_trt_model(torch_model)  # 转换并加载tensorrt模型
+    onnx_sess = load_onnx_model(torch_model)  # 转换并加载onnx模型
+    # onnx_2_trt_engine_by_trtexec()  # 通过trtexec命令将onnx模型转换为trt engine
+    onnx_2_trt_engine_by_api()  # 通过api将onnx模型转换为trt engine
+    trt_engine, trt_ctx = load_trt_engine()  # 加载tensorrt engine
 
     # Torch output top-5 id: [282 281 287 285 283], predict class name: tiger cat
-    # Pure-trt output top-5 id: [282 281 287 285 283], predict class name: tiger cat
+    # Pure-trt output top-5 id: [282 281 287 286 285], predict class name: tiger cat
     confirm_output(data, torch_model, trt_engine, trt_ctx)  # 比较模型的输出是否一致
 
-    # torch_speed: {'mean': 6.454062859993428, 'median': 6.378020749980351, 'std': 0.3652696340397562}
-    # trt_speed: {'mean': 2.8215294500023447, 'median': 2.8216907999649266, 'std': 0.008183779458733451}
+    # torch_speed: {'mean': 7.033054710191209, 'median': 6.985245400574058, 'std': 0.293545608784793}
+    # trt_speed:{'mean': 1.0991210502106696, 'median': 1.0872864484554157, 'std': 0.03211751369216253}
     compare_infer_speed(data, torch_model, trt_engine, trt_ctx)  # 比较模型的推理速度
