@@ -56,8 +56,8 @@ def load_data():
     img_url = "https://github.com/dmlc/mxnet.js/blob/main/data/cat.png?raw=true"
     urllib.request.urlretrieve(img_url, './cat.png')
     img = Image.open('./cat.png').resize((224, 224))
-    plt.imshow(img)
-    plt.show()
+    # plt.imshow(img)
+    # plt.show()
     img = np.array(img)[np.newaxis, :].astype("float32")
     data = preprocess_input(img)
     return data
@@ -162,9 +162,9 @@ def onnx_2_trt_engine_by_api():
     # 混合精度
     config.set_flag(trt.BuilderFlag.TF32)
     config.set_flag(trt.BuilderFlag.FP16)
-    config.set_flag(trt.BuilderFlag.INT8)  # int8量化
-    config.set_quantization_flag(trt.QuantizationFlag.CALIBRATE_BEFORE_FUSION)
-    config.int8_calibrator = MyCalibrator()  # int8量化的校准器，提供一些代表性输入，方便trt量化时计算激活函数范围用于量化
+    # config.set_flag(trt.BuilderFlag.INT8)  # int8量化
+    # config.set_quantization_flag(trt.QuantizationFlag.CALIBRATE_BEFORE_FUSION)
+    # config.int8_calibrator = MyCalibrator()  # int8量化的校准器，提供一些代表性输入，方便trt量化时计算激活函数范围用于量化
     # 动态输入shape
     op_profile = builder.create_optimization_profile()
     op_profile.set_shape(network.get_input(0).name, min=trt.Dims([1, 3, 224, 224]), opt=trt.Dims([64, 3, 224, 224]),
@@ -221,7 +221,7 @@ def trt_infer(input_idx, h_input, h_output, d_input, d_output, trt_ctx, stream):
     return h_output[:output_volume].reshape((h_input.shape[0], 1000))
 
 
-def confirm_output(data, torch_model, trt_engine, trt_ctx):
+def confirm_output(data, torch_model, onnx_session, trt_engine, trt_ctx):
     """确认不同模型输出是否一致"""
     urllib.request.urlretrieve(SYNSET_URL, SYNSET_NAME)
     with open(SYNSET_NAME) as f:
@@ -231,6 +231,12 @@ def confirm_output(data, torch_model, trt_engine, trt_ctx):
     torch_output = torch_model(input_x.cuda())
     torch_top5 = torch.argsort(torch_output, 1).cpu().detach().numpy()[0][-1:-6:-1]
     print("Torch output top-5 id: {}, predict class name: {}".format(torch_top5, synset[torch_top5[0]]))
+
+    input_name = onnx_sess.get_inputs()[0].name
+    output_name = onnx_sess.get_outputs()[0].name
+    onnx_output = onnx_sess.run([output_name], {input_name: data})
+    top5_onnx = np.argsort(onnx_output[0][0])[-1:-6:-1]
+    print("Onnx output top-5 id: {}, predict class name: {}".format(top5_onnx, synset[top5_onnx[0]]))
 
     input_idx = trt_engine['input']
     output_idx = trt_engine['output']
@@ -243,7 +249,7 @@ def confirm_output(data, torch_model, trt_engine, trt_ctx):
     print("Pure-trt output top-5 id: {}, predict class name: {}".format(top5_trt, synset[top5_trt[0]]))
 
 
-def compare_infer_speed(data, torch_model, trt_engine, trt_ctx):
+def compare_infer_speed(data, torch_model, onnx_sess, trt_engine, trt_ctx):
     """比较不同模型的推理速度"""
     timing_number = 10
     timing_repeat = 10
@@ -257,6 +263,19 @@ def compare_infer_speed(data, torch_model, trt_engine, trt_ctx):
         "mean": np.mean(torch_speed),
         "median": np.median(torch_speed),
         "std": np.std(torch_speed),
+    }
+
+    input_name = onnx_sess.get_inputs()[0].name
+    output_name = onnx_sess.get_outputs()[0].name
+    onnx_speed = (
+            np.array(timeit.Timer(lambda: onnx_sess.run([output_name], {input_name: data}))
+                     .repeat(repeat=timing_repeat, number=timing_number))
+            * 1000 / timing_number
+    )
+    onnx_speed = {
+        "mean": np.mean(onnx_speed),
+        "median": np.median(onnx_speed),
+        "std": np.std(onnx_speed),
     }
 
     input_idx = trt_engine['input']
@@ -276,7 +295,7 @@ def compare_infer_speed(data, torch_model, trt_engine, trt_ctx):
         "std": np.std(trt_speed),
     }
 
-    print('torch_speed: {}\ntrt_speed:{}'.format(torch_speed, trt_speed))
+    print('torch_speed: {}\nonnx_speed:{}\ntrt_speed:{}'.format(torch_speed, onnx_speed, trt_speed))
 
 
 if __name__ == '__main__':
@@ -289,9 +308,11 @@ if __name__ == '__main__':
     trt_engine, trt_ctx = load_trt_engine()  # 加载tensorrt engine
 
     # Torch output top-5 id: [282 281 287 285 283], predict class name: tiger cat
-    # Pure-trt output top-5 id: [282 281 287 286 285], predict class name: tiger cat
-    confirm_output(data, torch_model, trt_engine, trt_ctx)  # 比较模型的输出是否一致
+    # Onnx output top-5 id: [282 281 287 285 283], predict class name: tiger cat
+    # Pure-trt output top-5 id: [282 281 287 285 283], predict class name: tiger cat
+    confirm_output(data, torch_model, onnx_sess, trt_engine, trt_ctx)  # 比较模型的输出是否一致
 
-    # torch_speed: {'mean': 7.033054710191209, 'median': 6.985245400574058, 'std': 0.293545608784793}
-    # trt_speed:{'mean': 1.0991210502106696, 'median': 1.0872864484554157, 'std': 0.03211751369216253}
-    compare_infer_speed(data, torch_model, trt_engine, trt_ctx)  # 比较模型的推理速度
+    # torch_speed: {'mean': 6.773437949977961, 'median': 6.643094050014042, 'std': 0.32557030622709593}
+    # onnx_speed:{'mean': 18.87734026999169, 'median': 18.866386999980023, 'std': 0.09169522564388215}
+    # trt_speed:{'mean': 2.316488880042016, 'median': 2.312389200051257, 'std': 0.015701868470197833}
+    compare_infer_speed(data, torch_model, onnx_sess, trt_engine, trt_ctx)  # 比较模型的推理速度
