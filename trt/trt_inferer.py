@@ -1,4 +1,4 @@
-# Brief Tensorrt inferer. Use as following:
+# Tensorrt inferer. Use as following:
 # trt_inferer = trt_inferer.SimpleTrtInferer(trt_engine_path=trt_path,
 #                                            max_inp_shape=(1, MAX_HEIGHT, MAX_WIDTH, 3),
 #                                            max_out_shape=(1, MAX_HEIGHT, MAX_WIDTH, 3),
