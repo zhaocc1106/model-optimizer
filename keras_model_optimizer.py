@@ -140,9 +140,9 @@ def tvm_compile(keras_model, shape_dict, auto_tune=True):
 
 def load_data():
     """加载测试数据"""
-    img_url = "https://github.com/dmlc/mxnet.js/blob/main/data/cat.png?raw=true"
-    img_path = download_testdata(img_url, "cat.png", module="data")
-    img = Image.open(img_path).resize((224, 224))
+    # img_url = "https://github.com/dmlc/mxnet.js/blob/main/data/cat.png?raw=true"
+    # img_path = download_testdata(img_url, "cat.png", module="data")
+    img = Image.open('./cat.png').resize((224, 224))
     # plt.imshow(img)
     # plt.show()
     data = np.array(img)[np.newaxis, :].astype("float32")

@@ -53,8 +53,8 @@ def preprocess_input(img):
 def load_data():
     """加载测试数据"""
     print('Loading image data...')
-    img_url = "https://github.com/dmlc/mxnet.js/blob/main/data/cat.png?raw=true"
-    urllib.request.urlretrieve(img_url, './cat.png')
+    # img_url = "https://github.com/dmlc/mxnet.js/blob/main/data/cat.png?raw=true"
+    # urllib.request.urlretrieve(img_url, './cat.png')
     img = Image.open('./cat.png').resize((224, 224))
     # plt.imshow(img)
     # plt.show()
