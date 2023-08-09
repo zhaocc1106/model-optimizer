@@ -197,7 +197,7 @@ def trt_malloc(inp_data):
     """malloc tensorrt的input和output的cpu和gpu内存"""
     # h_input = cuda.pagelocked_empty(trt.volume(input_shape), dtype=np.float32)
     h_input = np.array(inp_data)
-    h_output = cuda.pagelocked_empty(MAX_BATCH_SIZE * 1000 * 4, dtype=np.float32)  # 可以申请比较大的batch size方便不同输入重复利用
+    h_output = cuda.pagelocked_empty(MAX_BATCH_SIZE * 1000, dtype=np.float32)  # 可以申请比较大的batch size方便不同输入重复利用
     # Allocate device memory for inputs and outputs.
     # print('h_input.nbytes: {}, h_output.nbytes: {}'.format(h_input.nbytes, h_output.nbytes))
     d_input = cuda.mem_alloc(MAX_BATCH_SIZE * 3 * 224 * 224 * 4)  # 可以申请比较大的batch size方便不同输入重复利用这块显存
