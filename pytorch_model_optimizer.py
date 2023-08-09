@@ -214,7 +214,7 @@ def trt_infer(input_idx, h_input, d_input, d_output, trt_ctx, stream):
     # 执行推理
     trt_ctx.execute_async_v2(bindings=[int(d_input), int(d_output)], stream_handle=stream.handle)
     # 拷贝输出数据从gpu到cpu
-    h_output = cuda.pagelocked_empty((batch_size, 1000), dtype=np.float32)  # 可以申请比较大的batch size方便不同输入重复利用
+    h_output = cuda.pagelocked_empty((batch_size, 1000), dtype=np.float32)
     cuda.memcpy_dtoh_async(h_output, d_output, stream)
     # 同步等待cuda stream执行完毕
     stream.synchronize()
