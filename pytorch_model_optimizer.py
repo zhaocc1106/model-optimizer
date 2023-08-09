@@ -197,17 +197,16 @@ def trt_malloc(inp_data):
     """malloc tensorrt的input和output的cpu和gpu内存"""
     # h_input = cuda.pagelocked_empty(trt.volume(input_shape), dtype=np.float32)
     h_input = np.array(inp_data)
-    h_output = cuda.pagelocked_empty(MAX_BATCH_SIZE * 1000, dtype=np.float32)  # 可以申请比较大的batch size方便不同输入重复利用
     # Allocate device memory for inputs and outputs.
     # print('h_input.nbytes: {}, h_output.nbytes: {}'.format(h_input.nbytes, h_output.nbytes))
     d_input = cuda.mem_alloc(MAX_BATCH_SIZE * 3 * 224 * 224 * 4)  # 可以申请比较大的batch size方便不同输入重复利用这块显存
     d_output = cuda.mem_alloc(MAX_BATCH_SIZE * 1000 * 4)  # 可以申请比较大的batch size方便不同输入重复利用这块显存
-    return h_input, h_output, d_input, d_output
+    return h_input, d_input, d_output
 
 
-def trt_infer(input_idx, h_input, h_output, d_input, d_output, trt_ctx, stream):
+def trt_infer(input_idx, h_input, d_input, d_output, trt_ctx, stream):
     """pure-trt模型推理"""
-    output_volume = trt.volume((h_input.shape[0], 1000))
+    batch_size = h_input.shape[0]
     # 设置真实的input shape
     trt_ctx.set_binding_shape(input_idx, h_input.shape)
     # 拷贝输入数据从cpu到gpu
@@ -215,10 +214,11 @@ def trt_infer(input_idx, h_input, h_output, d_input, d_output, trt_ctx, stream):
     # 执行推理
     trt_ctx.execute_async_v2(bindings=[int(d_input), int(d_output)], stream_handle=stream.handle)
     # 拷贝输出数据从gpu到cpu
-    cuda.memcpy_dtoh_async(h_output[:output_volume], d_output, stream)
+    h_output = cuda.pagelocked_empty((batch_size, 1000), dtype=np.float32)  # 可以申请比较大的batch size方便不同输入重复利用
+    cuda.memcpy_dtoh_async(h_output, d_output, stream)
     # 同步等待cuda stream执行完毕
     stream.synchronize()
-    return h_output[:output_volume].reshape((h_input.shape[0], 1000))
+    return h_output
 
 
 def confirm_output(data, torch_model, onnx_session, trt_engine, trt_ctx):
@@ -242,9 +242,9 @@ def confirm_output(data, torch_model, onnx_session, trt_engine, trt_ctx):
     output_idx = trt_engine['output']
     # print('input shape: {}, output shape: {}'.format(trt_ctx.get_binding_shape(input_idx),
     #                                                  trt_ctx.get_binding_shape(output_idx)))
-    h_input, h_output, d_input, d_output = trt_malloc(np.ascontiguousarray(data))
+    h_input, d_input, d_output = trt_malloc(np.ascontiguousarray(data))
     stream = cuda.Stream()  # 创建cuda stream，一个stream对应一系列cuda操作，譬如拷贝内存与执行cuda核函数
-    trt_out = trt_infer(input_idx, h_input, h_output, d_input, d_output, trt_ctx, stream)
+    trt_out = trt_infer(input_idx, h_input, d_input, d_output, trt_ctx, stream)
     top5_trt = np.argsort(trt_out[0])[-1:-6:-1]
     print("Pure-trt output top-5 id: {}, predict class name: {}".format(top5_trt, synset[top5_trt[0]]))
 
@@ -282,10 +282,10 @@ def compare_infer_speed(data, torch_model, onnx_sess, trt_engine, trt_ctx):
     output_idx = trt_engine['output']
     # print('input shape: {}, output shape: {}'.format(trt_ctx.get_binding_shape(input_idx),
     #                                                  trt_ctx.get_binding_shape(output_idx)))
-    h_input, h_output, d_input, d_output = trt_malloc(np.ascontiguousarray(data))
+    h_input, d_input, d_output = trt_malloc(np.ascontiguousarray(data))
     stream = cuda.Stream()  # 创建cuda stream，一个stream对应一系列cuda操作，譬如拷贝内存与执行cuda核函数
     trt_speed = (
-            np.array(timeit.Timer(lambda: trt_infer(input_idx, h_input, h_output, d_input, d_output, trt_ctx, stream))
+            np.array(timeit.Timer(lambda: trt_infer(input_idx, h_input, d_input, d_output, trt_ctx, stream))
                      .repeat(repeat=timing_repeat, number=timing_number))
             * 1000 / timing_number
     )
